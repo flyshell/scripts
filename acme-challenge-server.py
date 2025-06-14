@@ -1,4 +1,6 @@
 #cat /usr/local/bin/acme-challenge-server.py 
+#sudo chmod +x /usr/local/bin/acme-challenge-server.py
+#sudo systemctl restart acme-challenge
 #!/usr/bin/env python3
 import http.server
 import socketserver
