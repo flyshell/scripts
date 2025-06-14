@@ -11,14 +11,17 @@ set -euo pipefail
 CONFIG_DIR="/etc/haproxy"
 SITES_DIR="/etc/haproxy/sites"
 SSL_DIR="/etc/haproxy/ssl"
+HAPROXY_CERTS_DIR="/etc/ssl/haproxy"  # HAProxy 專用憑證目錄
 DOMAINS_DIR="$SITES_DIR"  # 為了保持向下相容
 SSL_CERTS_LIST="$SSL_DIR/ssl-certificates.txt"
 MAIN_CONFIG="$CONFIG_DIR/haproxy.cfg"
+MAPS_DIR="$CONFIG_DIR/maps"
+DOMAINS_MAP="$MAPS_DIR/domains.map"
 
 # 創建必要目錄
 create_directories() {
-    mkdir -p "$CONFIG_DIR" "$SITES_DIR" "$SSL_DIR"
-    chown -R haproxy:haproxy "$CONFIG_DIR" "$SITES_DIR" "$SSL_DIR" 2>/dev/null || true
+    mkdir -p "$MAPS_DIR" "$CONFIG_DIR" "$SITES_DIR" "$SSL_DIR" "$HAPROXY_CERTS_DIR"
+    chown -R haproxy:haproxy "$MAPS_DIR" "$CONFIG_DIR" "$SITES_DIR" "$SSL_DIR" "$HAPROXY_CERTS_DIR" 2>/dev/null || true
 }
 
 # 日誌函數
@@ -112,6 +115,141 @@ EOF
     success "主配置文件已初始化"
 }
 
+# 初始化域名映射文件
+init_domains_map() {
+    info "初始化域名映射文件..."
+    
+    cat > "$DOMAINS_MAP" << 'EOF'
+# 域名到後端的映射文件
+# 格式: domain.com backend_name
+# 
+# 此文件會動態更新，可使用 HAProxy Runtime API 即時更新
+# 更新命令: echo "show map /etc/haproxy/maps/domains.map" | socat stdio /run/haproxy/admin.sock
+
+EOF
+    
+    success "域名映射文件已初始化: $DOMAINS_MAP"
+}
+
+# 添加域名到 Map 文件
+add_domain_to_map() {
+    local domain=$1
+    local backend_name="${domain//./_}_backend"
+    
+    info "添加 $domain 到域名映射..."
+    
+    # 檢查域名是否已存在
+    if grep -q "^$domain " "$DOMAINS_MAP" 2>/dev/null; then
+        warning "域名 $domain 已存在於映射中，將更新..."
+        # 移除舊記錄
+        sed -i "/^$domain /d" "$DOMAINS_MAP"
+    fi
+    
+    # 添加新記錄
+    echo "$domain $backend_name" >> "$DOMAINS_MAP"
+    
+    success "已添加域名映射: $domain -> $backend_name"
+    
+    # 如果 HAProxy 正在運行，動態更新映射
+    if systemctl is-active --quiet haproxy && [ -S /run/haproxy/admin.sock ]; then
+        info "動態更新 HAProxy 映射..."
+        echo "set map /etc/haproxy/maps/domains.map $domain $backend_name" | \
+            socat stdio /run/haproxy/admin.sock 2>/dev/null || \
+            warning "無法動態更新映射，將在重載時生效"
+    fi
+}
+
+# 從 Map 文件移除域名
+remove_domain_from_map() {
+    local domain=$1
+    
+    info "從域名映射移除 $domain..."
+    
+    # 從文件中移除
+    if grep -q "^$domain " "$DOMAINS_MAP" 2>/dev/null; then
+        sed -i "/^$domain /d" "$DOMAINS_MAP"
+        success "已從映射文件移除: $domain"
+        
+        # 如果 HAProxy 正在運行，動態移除映射
+        if systemctl is-active --quiet haproxy && [ -S /run/haproxy/admin.sock ]; then
+            info "動態移除 HAProxy 映射..."
+            echo "del map /etc/haproxy/maps/domains.map $domain" | \
+                socat stdio /run/haproxy/admin.sock 2>/dev/null || \
+                warning "無法動態移除映射，將在重載時生效"
+        fi
+    else
+        warning "域名 $domain 不存在於映射中"
+    fi
+}
+
+# 重建域名映射文件
+rebuild_domains_map() {
+    info "重建域名映射文件..."
+    
+    # 備份現有映射
+    if [ -f "$DOMAINS_MAP" ]; then
+        cp "$DOMAINS_MAP" "${DOMAINS_MAP}.backup"
+    fi
+    
+    # 重新初始化映射文件
+    init_domains_map
+    
+    # 掃描所有站點配置並重建映射
+    if [ -d "$SITES_DIR" ]; then
+        for config_file in "$SITES_DIR"/*.cfg; do
+            if [ -f "$config_file" ]; then
+                local basename=$(basename "$config_file" .cfg)
+                
+                # 跳過前端配置文件
+                if [ "$basename" = "00-frontend" ]; then
+                    continue
+                fi
+                
+                local domain="$basename"
+                local backend_name="${domain//./_}_backend"
+                
+                # 檢查後端是否存在於配置文件中
+                if grep -q "backend $backend_name" "$config_file"; then
+                    echo "$domain $backend_name" >> "$DOMAINS_MAP"
+                    info "重建映射: $domain -> $backend_name"
+                fi
+            fi
+        done
+    fi
+    
+    success "域名映射文件已重建"
+}
+
+# 顯示當前域名映射
+show_domains_map() {
+    info "當前域名映射:"
+    echo ""
+    
+    if [ -f "$DOMAINS_MAP" ] && [ -s "$DOMAINS_MAP" ]; then
+        printf "%-35s %-35s\n" "域名" "後端"
+        printf "%-35s %-35s\n" "----" "----"
+        
+        # 只顯示非註釋行
+        grep -v '^#' "$DOMAINS_MAP" | grep -v '^$' | while read domain backend; do
+            if [ -n "$domain" ] && [ -n "$backend" ]; then
+                printf "%-35s %-35s\n" "$domain" "$backend"
+            fi
+        done
+    else
+        warning "域名映射文件為空或不存在"
+    fi
+    
+    echo ""
+    
+    # 如果 HAProxy 正在運行，顯示運行時映射
+    if systemctl is-active --quiet haproxy && [ -S /run/haproxy/admin.sock ]; then
+        info "HAProxy 運行時映射:"
+        echo "show map /etc/haproxy/maps/domains.map" | \
+            socat stdio /run/haproxy/admin.sock 2>/dev/null || \
+            warning "無法獲取運行時映射"
+    fi
+}
+
 # 初始化共用前端配置
 init_frontend_config() {
     local frontend_config="$SITES_DIR/00-frontend.cfg"
@@ -119,7 +257,7 @@ init_frontend_config() {
     info "初始化前端配置..."
     
     cat > "$frontend_config" << 'EOF'
-# 主前端配置
+# 主前端配置 - 使用 Map Files 實現動態路由
 frontend main_frontend
     bind *:80
     bind *:443 ssl crt-list /etc/haproxy/ssl/ssl-certificates.txt
@@ -130,21 +268,35 @@ frontend main_frontend
     http-response set-header X-XSS-Protection "1; mode=block" if { ssl_fc }
     http-response set-header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" if { ssl_fc }
 
-    # ACME Challenge 處理 (最高優先級)
-    use_backend acme_challenge if { path_beg /.well-known/acme-challenge/ }
-    
+    # 使用變數存儲主機名
+    http-request set-var(txn.host) req.hdr(host),lower
+    http-request set-var(txn.sni) ssl_fc_sni,lower
+
+    # WWW 重導向處理
+    http-request redirect location https://%[req.hdr(host),regsub(^www\.,)] code 301 if { req.hdr(host) -m beg www. } { ssl_fc }
+    http-request redirect location http://%[req.hdr(host),regsub(^www\.,)] code 301 if { req.hdr(host) -m beg www. } !{ ssl_fc } !{ path_beg /.well-known/acme-challenge/ }
+
     # HTTP 重導向到 HTTPS (除了 ACME Challenge)
     http-request redirect scheme https code 301 unless { ssl_fc } or { path_beg /.well-known/acme-challenge/ }
     
-    # 預設後端（當沒有匹配的域名時）
+    # ACME Challenge 處理 (最高優先級)
+    use_backend acme_challenge if { path_beg /.well-known/acme-challenge/ }
+    
+    # 使用 Map File 進行動態路由選擇
+    use_backend %[var(txn.sni),map(/etc/haproxy/maps/domains.map,default_backend)] if { ssl_fc } { var(txn.sni),map(/etc/haproxy/maps/domains.map) -m found }
+    use_backend %[var(txn.host),map(/etc/haproxy/maps/domains.map,default_backend)] if { var(txn.host),map(/etc/haproxy/maps/domains.map) -m found }
+    
+    # 預設後端
     default_backend default_backend
 
 # ACME Challenge 後端
 backend acme_challenge
+    mode http
     server acme-server 127.0.0.1:8888 check
 
 # 預設後端
 backend default_backend
+    mode http
     http-request return status 404 content-type text/html string "<h1>404 Not Found</h1><p>Domain not configured</p>"
 EOF
 
@@ -186,24 +338,9 @@ generate_site_config() {
 # 後端: $backends
 # 創建時間: $(date)
 # 配置文件: ${domain}.cfg
-
-# $domain 域名路由 (擴展 main_frontend)
-frontend main_frontend
-    # $domain 主域名路由
-    use_backend ${domain//./_}_backend if { hdr(host) -i $domain } or { ssl_fc_sni $domain }
-EOF
-
-    # 檢查是否為主域名（沒有子域名），如果是則添加 www 重導向
-    local domain_parts=$(echo "$domain" | tr '.' '\n' | wc -l)
-    if [ $domain_parts -eq 2 ]; then
-        cat >> "$site_config" << EOF
-    
-    # WWW 重導向到主域名
-    http-request redirect location https://$domain%[capture.req.uri] code 301 if { hdr(host) -i www.$domain } or { ssl_fc_sni www.$domain }
-EOF
-    fi
-
-    cat >> "$site_config" << EOF
+# 
+# 注意：此文件只包含 backend 配置
+# frontend 路由規則在 00-frontend.cfg 中
 
 # $domain 後端配置
 backend ${domain//./_}_backend
@@ -234,34 +371,59 @@ update_ssl_list() {
     info "更新 SSL 憑證清單..."
     
     # 確保 SSL 目錄存在
-    mkdir -p "$SSL_DIR"
+    mkdir -p "$SSL_DIR" "$HAPROXY_CERTS_DIR"
     
     # 重新生成憑證清單
     > "$SSL_CERTS_LIST"
     
     local cert_count=0
     
-    # 只處理包含私鑰的 HAProxy SSL 憑證
-    for cert_file in /etc/ssl/certs/*.pem; do
+    info "檢查 HAProxy 憑證目錄: $HAPROXY_CERTS_DIR"
+    
+    # 處理 HAProxy 專用目錄中的憑證
+    for cert_file in "$HAPROXY_CERTS_DIR"/*.pem; do
         if [ -f "$cert_file" ]; then
-            # 檢查文件是否包含私鑰（HAProxy 格式）
-            if grep -q "BEGIN PRIVATE KEY" "$cert_file" || grep -q "BEGIN RSA PRIVATE KEY" "$cert_file"; then
-                # 進一步檢查是否包含憑證
-                if grep -q "BEGIN CERTIFICATE" "$cert_file"; then
-                    echo "$cert_file" >> "$SSL_CERTS_LIST"
-                    ((cert_count++))
-                    success "添加 SSL 憑證: $(basename "$cert_file")"
-                fi
+            info "檢查文件: $(basename "$cert_file")"
+            
+            # 檢查文件是否包含私鑰（支援 RSA 和 EC 格式）
+            local has_private_key=false
+            local has_certificate=false
+            
+            # 使用 grep -q 避免 set -e 問題
+            if grep -q "BEGIN PRIVATE KEY\|BEGIN RSA PRIVATE KEY\|BEGIN EC PRIVATE KEY" "$cert_file" 2>/dev/null; then
+                has_private_key=true
+                info "  ✓ 包含私鑰"
+            else
+                info "  ✗ 缺少私鑰"
+            fi
+            
+            # 檢查是否包含憑證
+            if grep -q "BEGIN CERTIFICATE" "$cert_file" 2>/dev/null; then
+                has_certificate=true
+                info "  ✓ 包含憑證"
+            else
+                info "  ✗ 缺少憑證"
+            fi
+            
+            if [ "$has_private_key" = true ] && [ "$has_certificate" = true ]; then
+                echo "$cert_file" >> "$SSL_CERTS_LIST"
+                cert_count=$((cert_count + 1))
+                success "添加 SSL 憑證: $(basename "$cert_file")"
+            else
+                warning "跳過 $(basename "$cert_file"): HAProxy 格式不正確"
             fi
         fi
     done
     
     if [ $cert_count -gt 0 ]; then
         success "SSL 憑證清單已更新: $cert_count 個有效憑證"
+        info "憑證清單內容："
+        cat "$SSL_CERTS_LIST"
     else
         warning "沒有找到有效的 HAProxy SSL 憑證"
-        echo "# No valid HAProxy SSL certificates found" > "$SSL_CERTS_LIST"
+        echo "# No valid HAProxy SSL certificates found in $HAPROXY_CERTS_DIR" > "$SSL_CERTS_LIST"
         echo "# HAProxy SSL certificates must contain both certificate and private key" >> "$SSL_CERTS_LIST"
+        echo "# Please check certificate format or run certificate generation" >> "$SSL_CERTS_LIST"
     fi
 }
 
@@ -341,6 +503,9 @@ add_domain() {
     
     # 生成站點配置
     generate_site_config "$domain" "$backends"
+
+    # 添加域名到 Map 文件
+    add_domain_to_map "$domain"
     
     # 生成 SSL 憑證
     info "生成 SSL 憑證..."
@@ -383,6 +548,9 @@ remove_domain() {
     
     # 備份配置
     backup_config
+
+    # 從 Map 文件移除域名
+    remove_domain_from_map "$domain"
     
     # 移除站點配置文件
     if [ -f "$SITES_DIR/${domain}.cfg" ]; then
@@ -494,6 +662,9 @@ init_system() {
     # 初始化配置文件
     init_main_config
     init_frontend_config
+
+    # 初始化 Map 文件
+    init_domains_map
     
     # 更新 systemd 配置
     update_systemd_config
@@ -509,6 +680,7 @@ init_system() {
         info "系統資訊:"
         echo "  主配置:   $MAIN_CONFIG"
         echo "  站點目錄: $SITES_DIR"
+        echo "  映射目錄: $MAPS_DIR"
         echo "  SSL 目錄: $SSL_DIR"
         echo "  統計頁面: http://your-server:8404"
         echo ""
@@ -516,6 +688,8 @@ init_system() {
         echo "  添加域名: $0 add domain.com 127.0.0.1:8001,127.0.0.1:8002"
         echo "  移除域名: $0 remove domain.com"
         echo "  列出域名: $0 list"
+        echo "  顯示映射: $0 map"
+        echo "  重建映射: $0 rebuild-map"
         echo "  重新載入: $0 reload"
     else
         error "初始化失敗，請檢查配置"
@@ -534,6 +708,8 @@ show_help() {
     echo "  add <domain> <backends>  - 添加域名"
     echo "  remove <domain>          - 移除域名"
     echo "  list                     - 列出所有域名"
+    echo "  map                      - 顯示映射"
+    echo "  rebuild-map              - 重建映射"
     echo "  reload                   - 重新載入配置"
     echo "  test                     - 測試配置"
     echo "  help                     - 顯示此幫助"
@@ -546,9 +722,10 @@ show_help() {
     echo "  $0 reload"
     echo ""
     echo "檔案結構:"
-    echo "  /etc/haproxy/haproxy.cfg     - 主配置檔案"
-    echo "  /etc/haproxy/sites/*.cfg     - 站點配置檔案"
-    echo "  /etc/haproxy/ssl/            - SSL 相關檔案"
+    echo "  /etc/haproxy/haproxy.cfg       - 主配置檔案"
+    echo "  /etc/haproxy/sites/*.cfg       - 站點配置檔案"
+    echo "  /etc/haproxy/maps/domains.map  - 映射配置檔案"
+    echo "  /etc/haproxy/ssl/              - SSL 相關檔案"
 }
 
 # 主函數
@@ -565,6 +742,12 @@ main() {
             ;;
         "list")
             list_domains
+            ;;
+        "map")
+            show_domains_map
+            ;;
+        "rebuild-map")
+            rebuild_domains_map
             ;;
         "reload")
             reload_all
