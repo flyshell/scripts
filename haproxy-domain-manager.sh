@@ -122,19 +122,21 @@ init_frontend_config() {
 # 主前端配置
 frontend main_frontend
     bind *:80
-    bind *:443 ssl crt-list /etc/haproxy/ssl/ssl-certificates.txt
+    
+    # 條件性綁定 HTTPS（只有在有 SSL 憑證時）
+    # 註解：如果沒有 SSL 憑證，會在添加第一個域名時啟用 HTTPS
 
-    # 安全性標頭
-    http-response set-header X-Frame-Options DENY
-    http-response set-header X-Content-Type-Options nosniff
-    http-response set-header X-XSS-Protection "1; mode=block"
-    http-response set-header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    # 安全性標頭（僅對 HTTPS）
+    http-response set-header X-Frame-Options DENY if { ssl_fc }
+    http-response set-header X-Content-Type-Options nosniff if { ssl_fc }
+    http-response set-header X-XSS-Protection "1; mode=block" if { ssl_fc }
+    http-response set-header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" if { ssl_fc }
 
     # ACME Challenge 處理 (最高優先級)
     use_backend acme_challenge if { path_beg /.well-known/acme-challenge/ }
     
-    # HTTP 重導向到 HTTPS (除了 ACME Challenge)
-    http-request redirect scheme https code 301 unless { ssl_fc } or { path_beg /.well-known/acme-challenge/ }
+    # HTTP 重導向到 HTTPS (除了 ACME Challenge，且僅在有 SSL 憑證時)
+    # 註解：會在有 SSL 憑證後動態啟用
     
     # 預設後端（當沒有匹配的域名時）
     default_backend default_backend
@@ -149,6 +151,28 @@ backend default_backend
 EOF
 
     success "前端配置已初始化"
+}
+
+# 更新前端配置以啟用 HTTPS
+update_frontend_for_ssl() {
+    local frontend_config="$SITES_DIR/00-frontend.cfg"
+    
+    info "更新前端配置以啟用 HTTPS..."
+    
+    # 檢查是否有有效的 SSL 憑證
+    if [ -s "$SSL_CERTS_LIST" ] && [ "$(grep -v '^#' "$SSL_CERTS_LIST" | wc -l)" -gt 0 ]; then
+        # 更新前端配置以包含 HTTPS 綁定
+        sed -i 's|^    # 條件性綁定 HTTPS.*|    bind *:443 ssl crt-list /etc/haproxy/ssl/ssl-certificates.txt|' "$frontend_config"
+        sed -i 's|^    # 註解：如果沒有 SSL 憑證.*||' "$frontend_config"
+        
+        # 啟用 HTTP 到 HTTPS 重導向
+        sed -i 's|^    # HTTP 重導向到 HTTPS.*|    http-request redirect scheme https code 301 unless { ssl_fc } or { path_beg /.well-known/acme-challenge/ }|' "$frontend_config"
+        sed -i 's|^    # 註解：會在有 SSL 憑證後動態啟用||' "$frontend_config"
+        
+        success "前端配置已更新以支援 HTTPS"
+    else
+        warning "沒有有效的 SSL 憑證，HTTPS 綁定保持停用狀態"
+    fi
 }
 
 # 產生域名站點配置
@@ -217,17 +241,29 @@ update_ssl_list() {
     # 重新生成憑證清單
     > "$SSL_CERTS_LIST"
     
+    local cert_count=0
+    
+    # 只處理包含私鑰的 HAProxy SSL 憑證
     for cert_file in /etc/ssl/certs/*.pem; do
         if [ -f "$cert_file" ]; then
-            echo "$cert_file" >> "$SSL_CERTS_LIST"
+            # 檢查文件是否包含私鑰（HAProxy 格式）
+            if grep -q "BEGIN PRIVATE KEY" "$cert_file" || grep -q "BEGIN RSA PRIVATE KEY" "$cert_file"; then
+                # 進一步檢查是否包含憑證
+                if grep -q "BEGIN CERTIFICATE" "$cert_file"; then
+                    echo "$cert_file" >> "$SSL_CERTS_LIST"
+                    ((cert_count++))
+                    success "添加 SSL 憑證: $(basename "$cert_file")"
+                fi
+            fi
         fi
     done
     
-    if [ -s "$SSL_CERTS_LIST" ]; then
-        success "SSL 憑證清單已更新: $(wc -l < "$SSL_CERTS_LIST") 個憑證"
+    if [ $cert_count -gt 0 ]; then
+        success "SSL 憑證清單已更新: $cert_count 個有效憑證"
     else
-        warning "沒有找到 SSL 憑證"
-        echo "# No SSL certificates found" > "$SSL_CERTS_LIST"
+        warning "沒有找到有效的 HAProxy SSL 憑證"
+        echo "# No valid HAProxy SSL certificates found" > "$SSL_CERTS_LIST"
+        echo "# HAProxy SSL certificates must contain both certificate and private key" >> "$SSL_CERTS_LIST"
     fi
 }
 
@@ -313,6 +349,7 @@ add_domain() {
     if /usr/local/bin/dehydrated --cron --domain "$domain"; then
         success "SSL 憑證生成成功"
         update_ssl_list
+        update_frontend_for_ssl
     else
         error "SSL 憑證生成失敗"
         exit 1
