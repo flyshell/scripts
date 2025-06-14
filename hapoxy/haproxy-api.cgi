@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # HAProxy 域名管理 CGI API
-# 放置於 /usr/lib/cgi-bin/haproxy-api.cgi
+# 放置於 /var/www/haproxy-manager/cgi-bin/haproxy-api.cgi
 
 # 設定變數
 DOMAIN_MANAGER="/usr/local/bin/haproxy-domain-manager.sh"
@@ -34,15 +34,31 @@ send_success() {
     fi
 }
 
-# 檢查權限
-if [ "$EUID" -ne 0 ]; then
-    send_error "需要管理員權限"
-fi
+# 檢查 sudo 權限
+check_sudo_permissions() {
+    if ! sudo -n -l /usr/local/bin/haproxy-domain-manager.sh >/dev/null 2>&1; then
+        send_error "CGI 腳本缺少 sudo 權限，請檢查 sudoers 配置"
+    fi
+}
+
+# 執行帶 sudo 的命令
+run_with_sudo() {
+    local command="$1"
+    shift
+    
+    if ! sudo "$command" "$@" 2>&1; then
+        return 1
+    fi
+    return 0
+}
 
 # 檢查腳本是否存在
 if [ ! -f "$DOMAIN_MANAGER" ]; then
     send_error "域名管理腳本不存在"
 fi
+
+# 檢查 sudo 權限
+check_sudo_permissions
 
 # 讀取 POST 數據
 if [ "$REQUEST_METHOD" = "POST" ]; then
@@ -73,7 +89,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             fi
             
             # 執行添加域名
-            if OUTPUT=$("$DOMAIN_MANAGER" add "$DOMAIN" "$SERVERS" 2>&1); then
+            if OUTPUT=$(run_with_sudo "$DOMAIN_MANAGER" add "$DOMAIN" "$SERVERS" 2>&1); then
                 send_success "\"message\": \"域名 $DOMAIN 添加成功\""
             else
                 send_error "添加域名失敗: $OUTPUT"
@@ -89,7 +105,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             fi
             
             # 執行移除域名
-            if OUTPUT=$("$DOMAIN_MANAGER" remove "$DOMAIN" 2>&1); then
+            if OUTPUT=$(run_with_sudo "$DOMAIN_MANAGER" remove "$DOMAIN" 2>&1); then
                 send_success "\"message\": \"域名 $DOMAIN 移除成功\""
             else
                 send_error "移除域名失敗: $OUTPUT"
@@ -98,7 +114,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             
         "list-domains")
             # 列出所有域名
-            DOMAINS_OUTPUT=$("$DOMAIN_MANAGER" list 2>&1)
+            DOMAINS_OUTPUT=$(run_with_sudo "$DOMAIN_MANAGER" list 2>&1)
             
             # 解析域名列表（簡化版）
             DOMAINS_JSON="["
