@@ -713,6 +713,9 @@ main() {
         "reload")
             reload_haproxy
             ;;
+        "init-ssl")
+            init_ssl_tool
+            ;;
         "help"|"--help"|"-h")
             show_help
             ;;
