@@ -122,9 +122,7 @@ init_frontend_config() {
 # 主前端配置
 frontend main_frontend
     bind *:80
-    
-    # 條件性綁定 HTTPS（只有在有 SSL 憑證時）
-    # 註解：如果沒有 SSL 憑證，會在添加第一個域名時啟用 HTTPS
+    bind *:443 ssl crt-list /etc/haproxy/ssl/ssl-certificates.txt
 
     # 安全性標頭（僅對 HTTPS）
     http-response set-header X-Frame-Options DENY if { ssl_fc }
@@ -135,8 +133,8 @@ frontend main_frontend
     # ACME Challenge 處理 (最高優先級)
     use_backend acme_challenge if { path_beg /.well-known/acme-challenge/ }
     
-    # HTTP 重導向到 HTTPS (除了 ACME Challenge，且僅在有 SSL 憑證時)
-    # 註解：會在有 SSL 憑證後動態啟用
+    # HTTP 重導向到 HTTPS (除了 ACME Challenge)
+    http-request redirect scheme https code 301 unless { ssl_fc } or { path_beg /.well-known/acme-challenge/ }
     
     # 預設後端（當沒有匹配的域名時）
     default_backend default_backend
@@ -188,9 +186,24 @@ generate_site_config() {
 # 後端: $backends
 # 創建時間: $(date)
 # 配置文件: ${domain}.cfg
-# 
-# 注意：此文件只包含 backend 配置
-# frontend 路由規則會自動添加到 00-frontend.cfg
+
+# $domain 域名路由 (擴展 main_frontend)
+frontend main_frontend
+    # $domain 主域名路由
+    use_backend ${domain//./_}_backend if { hdr(host) -i $domain } or { ssl_fc_sni $domain }
+EOF
+
+    # 檢查是否為主域名（沒有子域名），如果是則添加 www 重導向
+    local domain_parts=$(echo "$domain" | tr '.' '\n' | wc -l)
+    if [ $domain_parts -eq 2 ]; then
+        cat >> "$site_config" << EOF
+    
+    # WWW 重導向到主域名
+    http-request redirect location https://$domain%[capture.req.uri] code 301 if { hdr(host) -i www.$domain } or { ssl_fc_sni www.$domain }
+EOF
+    fi
+
+    cat >> "$site_config" << EOF
 
 # $domain 後端配置
 backend ${domain//./_}_backend
@@ -214,44 +227,6 @@ EOF
     echo "" >> "$site_config"
     
     success "$domain 的站點配置已生成: $site_config"
-}
-
-# 更新前端配置以添加域名路由
-add_domain_to_frontend() {
-    local domain=$1
-    local frontend_config="$SITES_DIR/00-frontend.cfg"
-    
-    info "添加 $domain 路由到前端配置..."
-    
-    # 在 default_backend 之前添加路由規則
-    local route_rules=""
-    
-    # 主域名路由
-    route_rules="    # $domain 路由\\n    use_backend ${domain//./_}_backend if { hdr(host) -i $domain } or { ssl_fc_sni $domain }"
-    
-    # 檢查是否為主域名，添加 www 重導向
-    local domain_parts=$(echo "$domain" | tr '.' '\n' | wc -l)
-    if [ $domain_parts -eq 2 ]; then
-        route_rules="$route_rules\\n    http-request redirect location https://$domain%[capture.req.uri] code 301 if { hdr(host) -i www.$domain } or { ssl_fc_sni www.$domain }"
-    fi
-    
-    # 在 default_backend 前插入路由規則
-    sed -i "/# 預設後端/i\\    $route_rules\\n" "$frontend_config"
-    
-    success "已添加 $domain 路由到前端配置"
-}
-
-# 從前端配置移除域名路由
-remove_domain_from_frontend() {
-    local domain=$1
-    local frontend_config="$SITES_DIR/00-frontend.cfg"
-    
-    info "從前端配置移除 $domain 路由..."
-    
-    # 移除相關的路由規則
-    sed -i "/# $domain 路由/,+2d" "$frontend_config"
-    
-    success "已從前端配置移除 $domain 路由"
 }
 
 # 更新 SSL 憑證清單
@@ -367,15 +342,11 @@ add_domain() {
     # 生成站點配置
     generate_site_config "$domain" "$backends"
     
-    # 添加域名路由到前端配置
-    add_domain_to_frontend "$domain"
-    
     # 生成 SSL 憑證
     info "生成 SSL 憑證..."
     if /usr/local/bin/dehydrated --cron --domain "$domain"; then
         success "SSL 憑證生成成功"
         update_ssl_list
-        update_frontend_for_ssl
     else
         error "SSL 憑證生成失敗"
         exit 1
@@ -420,9 +391,6 @@ remove_domain() {
     else
         warning "站點配置文件不存在: $SITES_DIR/${domain}.cfg"
     fi
-    
-    # 從前端配置移除域名路由
-    remove_domain_from_frontend "$domain"
     
     # 移除 SSL 憑證
     if [ -f "/etc/ssl/certs/${domain}.pem" ]; then
