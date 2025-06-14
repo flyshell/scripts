@@ -344,7 +344,8 @@ generate_site_config() {
 
 # $domain 後端配置
 backend ${domain//./_}_backend
-    balance roundrobin
+    balance source
+    hash-type consistent
     option httpclose
     option forwardfor
     option httpchk GET /
