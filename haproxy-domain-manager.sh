@@ -57,6 +57,33 @@ warning() {
     log "WARNING: $1"
 }
 
+# 檢查並初始化 SSL 工具
+check_ssl_tool_init() {
+    if [ "$SSL_TOOL" = "dehydrated" ]; then
+        # 檢查 dehydrated 是否已註冊
+        if [ ! -f "/etc/dehydrated/accounts/*/account_key.pem" ] 2>/dev/null; then
+            info "首次使用 dehydrated，正在註冊..."
+            
+            # 自動接受服務條款並註冊
+            if ! dehydrated --register --accept-terms >/dev/null 2>&1; then
+                error "dehydrated 註冊失敗，請手動執行: dehydrated --register --accept-terms"
+            fi
+            
+            success "dehydrated 註冊成功"
+        fi
+    elif [ "$SSL_TOOL" = "certbot" ]; then
+        # 檢查 certbot 是否已初始化
+        if [ ! -d "/etc/letsencrypt/accounts" ]; then
+            info "首次使用 certbot，正在初始化..."
+            
+            # 創建虛擬憑證以初始化 certbot
+            if ! certbot register --agree-tos --email "$CONTACT_EMAIL" --no-eff-email >/dev/null 2>&1; then
+                warning "certbot 初始化失敗，但可能仍能正常工作"
+            fi
+        fi
+    fi
+}
+
 # 檢查依賴
 check_dependencies() {
     info "檢查依賴工具..."
@@ -71,10 +98,14 @@ check_dependencies() {
         if ! command -v dehydrated &> /dev/null; then
             error "dehydrated 未安裝"
         fi
+        # 檢查並初始化 dehydrated
+        check_ssl_tool_init
     elif [ "$SSL_TOOL" = "certbot" ]; then
         if ! command -v certbot &> /dev/null; then
             error "certbot 未安裝"
         fi
+        # 檢查並初始化 certbot
+        check_ssl_tool_init
     fi
     
     # 檢查 jq (用於 JSON 處理)
@@ -94,10 +125,44 @@ init_directories() {
         touch "$SSL_CERT_LIST"
     fi
     
+    # 檢查並創建預設 SSL 憑證
+    create_default_ssl_cert
+    
     # 設定權限
     chown -R haproxy:haproxy "$HAPROXY_DIR"
     chmod 755 "$DOMAINS_DIR" "$BACKENDS_DIR" "$SSL_DIR" "$ERRORS_DIR"
     chmod 644 "$SSL_CERT_LIST"
+}
+
+# 創建預設 SSL 憑證
+create_default_ssl_cert() {
+    local default_cert="/etc/ssl/haproxy/default.pem"
+    
+    if [ ! -f "$default_cert" ]; then
+        info "創建預設 SSL 憑證..."
+        
+        # 創建目錄
+        mkdir -p /etc/ssl/haproxy
+        
+        # 生成自簽憑證
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/ssl/haproxy/default.key \
+            -out /etc/ssl/haproxy/default.crt \
+            -subj "/C=TW/ST=Taiwan/L=Taoyuan/O=HAProxy/CN=default.local" \
+            >/dev/null 2>&1
+        
+        # 合併憑證文件
+        cat /etc/ssl/haproxy/default.crt /etc/ssl/haproxy/default.key > "$default_cert"
+        
+        # 設定權限
+        chmod 600 "$default_cert"
+        chown haproxy:haproxy "$default_cert"
+        
+        # 清理臨時文件
+        rm -f /etc/ssl/haproxy/default.key /etc/ssl/haproxy/default.crt
+        
+        success "預設 SSL 憑證已創建: $default_cert"
+    fi
 }
 
 # 驗證域名格式
@@ -358,34 +423,76 @@ reload_haproxy() {
     success "HAProxy 已重載"
 }
 
-# 驗證域名配置
-verify_domain() {
-    local domain=$1
+# 檢查系統狀態
+check_system_status() {
+    info "檢查系統狀態..."
     
-    info "驗證域名 $domain 配置..."
-    
-    # 測試 HTTP 重導向
-    local http_response=$(curl -s -o /dev/null -w "%{http_code}" "http://$domain" || echo "000")
-    if [ "$http_response" != "301" ]; then
-        warning "HTTP 重導向測試失敗 (HTTP $http_response)"
+    # 檢查 HAProxy 狀態
+    if systemctl is-active --quiet haproxy; then
+        success "HAProxy 服務正在運行"
     else
-        success "HTTP 重導向測試通過"
+        warning "HAProxy 服務未運行"
     fi
     
-    # 測試 HTTPS 連接
-    local https_response=$(curl -s -o /dev/null -w "%{http_code}" "https://$domain" || echo "000")
-    if [ "$https_response" != "200" ]; then
-        warning "HTTPS 連接測試失敗 (HTTP $https_response)"
-    else
-        success "HTTPS 連接測試通過"
+    # 檢查 SSL 工具狀態
+    if [ "$SSL_TOOL" = "dehydrated" ]; then
+        if [ -f "/etc/dehydrated/accounts/*/account_key.pem" ] 2>/dev/null; then
+            success "dehydrated 已註冊並可使用"
+        else
+            warning "dehydrated 尚未註冊，請執行: dehydrated --register --accept-terms"
+            info "或者使用此腳本的 init-ssl 命令"
+        fi
+    elif [ "$SSL_TOOL" = "certbot" ]; then
+        if [ -d "/etc/letsencrypt/accounts" ]; then
+            success "certbot 已初始化並可使用"
+        else
+            warning "certbot 尚未初始化"
+        fi
     fi
     
-    # 測試 WWW 重導向
-    local www_response=$(curl -s -o /dev/null -w "%{http_code}" "https://www.$domain" || echo "000")
-    if [ "$www_response" != "301" ]; then
-        warning "WWW 重導向測試失敗 (HTTP $www_response)"
+    # 檢查目錄結構
+    for dir in "$DOMAINS_DIR" "$BACKENDS_DIR" "$SSL_DIR" "$ERRORS_DIR"; do
+        if [ -d "$dir" ]; then
+            success "目錄 $dir 存在"
+        else
+            warning "目錄 $dir 不存在"
+        fi
+    done
+    
+    # 檢查預設 SSL 憑證
+    if [ -f "/etc/ssl/haproxy/default.pem" ]; then
+        success "預設 SSL 憑證存在"
     else
-        success "WWW 重導向測試通過"
+        warning "預設 SSL 憑證不存在"
+    fi
+}
+
+# 初始化 SSL 工具
+init_ssl_tool() {
+    info "初始化 SSL 工具..."
+    
+    if [ "$SSL_TOOL" = "dehydrated" ]; then
+        info "正在註冊 dehydrated..."
+        
+        # 確保配置目錄存在
+        mkdir -p /etc/dehydrated
+        
+        # 註冊 dehydrated
+        if dehydrated --register --accept-terms; then
+            success "dehydrated 註冊成功"
+        else
+            error "dehydrated 註冊失敗"
+        fi
+        
+    elif [ "$SSL_TOOL" = "certbot" ]; then
+        info "正在初始化 certbot..."
+        
+        # 初始化 certbot
+        if certbot register --agree-tos --email "${CONTACT_EMAIL:-admin@example.com}" --no-eff-email; then
+            success "certbot 初始化成功"
+        else
+            error "certbot 初始化失敗"
+        fi
     fi
 }
 
@@ -536,6 +643,10 @@ HAProxy 域名自動化管理腳本
     test                     測試 HAProxy 配置
 
     reload                   重載 HAProxy
+
+    status                   檢查系統狀態
+
+    init-ssl                 初始化 SSL 工具 (首次使用必須執行)
 
     help                     顯示此幫助信息
 
