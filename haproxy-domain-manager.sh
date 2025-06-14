@@ -207,10 +207,27 @@ generate_ssl_cert() {
     
     info "為域名 $domain 產生 SSL 憑證..."
     
+    # 判斷是否為主域名（需要同時申請 www）
+    local domain_parts=$(echo "$domain" | tr '.' '\n' | wc -l)
+    local is_main_domain=false
+    
+    # 如果只有兩個部分（如 example.com），則為主域名
+    if [ $domain_parts -eq 2 ]; then
+        is_main_domain=true
+    fi
+    
     if [ "$SSL_TOOL" = "dehydrated" ]; then
         # 使用 dehydrated
-        if ! dehydrated --cron --domain "$domain" --domain "www.$domain"; then
-            error "dehydrated 憑證產生失敗"
+        if [ "$is_main_domain" = true ]; then
+            # 主域名同時申請 www
+            if ! dehydrated --cron --domain "$domain" --domain "www.$domain"; then
+                error "dehydrated 憑證產生失敗"
+            fi
+        else
+            # 子域名只申請自己
+            if ! dehydrated --cron --domain "$domain"; then
+                error "dehydrated 憑證產生失敗"
+            fi
         fi
         
         # 合併憑證文件
@@ -220,9 +237,18 @@ generate_ssl_cert() {
             
     elif [ "$SSL_TOOL" = "certbot" ]; then
         # 使用 certbot
-        if ! certbot certonly --webroot --webroot-path=/var/www/html \
-            -d "$domain" -d "www.$domain" --non-interactive --agree-tos; then
-            error "certbot 憑證產生失敗"
+        if [ "$is_main_domain" = true ]; then
+            # 主域名同時申請 www
+            if ! certbot certonly --webroot --webroot-path=/var/www/html \
+                -d "$domain" -d "www.$domain" --non-interactive --agree-tos; then
+                error "certbot 憑證產生失敗"
+            fi
+        else
+            # 子域名只申請自己
+            if ! certbot certonly --webroot --webroot-path=/var/www/html \
+                -d "$domain" --non-interactive --agree-tos; then
+                error "certbot 憑證產生失敗"
+            fi
         fi
         
         # 合併憑證文件
