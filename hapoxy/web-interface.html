@@ -336,8 +336,14 @@
                 
                 const result = await response.json();
                 
+                // 檢查 API 回應中的 success 欄位
+                if (result.success === false) {
+                    throw new Error(result.error || '操作失敗');
+                }
+                
+                // 檢查 HTTP 狀態碼
                 if (!response.ok) {
-                    throw new Error(result.error || '請求失敗');
+                    throw new Error(`HTTP ${response.status}: ${result.error || '請求失敗'}`);
                 }
                 
                 return result;
